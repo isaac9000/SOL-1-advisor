@@ -6,9 +6,24 @@ You are the PI for an iterative kernel optimization loop. A worker agent impleme
 
 ## Problem Specification
 
-**Task:** Triangle Multiplicative Update (TriMul) — outgoing variant — on NVIDIA H100.
+Implement the fastest possible **outgoing** TriMul operator from AlphaFold3. This is a core operation in protein structure prediction models (AlphaFold3, Chai, Protenix).
 
-This is a core operation in AlphaFold3, Chai, Protenix, and other protein structure prediction models.
+`custom_kernel` receives a tuple `(input_tensor, mask, weights, config)`:
+
+- `input_tensor` — `(bs, seqlen, seqlen, dim)` float32, on CUDA
+- `mask` — `(bs, seqlen, seqlen)` float32, on CUDA (1.0 = keep, 0.0 = mask out)
+- `weights` — dict of float32 tensors on CUDA:
+  - `norm.weight` shape `(dim,)`, `norm.bias` shape `(dim,)`
+  - `left_proj.weight` shape `(hidden_dim, dim)`
+  - `right_proj.weight` shape `(hidden_dim, dim)`
+  - `left_gate.weight` shape `(hidden_dim, dim)`
+  - `right_gate.weight` shape `(hidden_dim, dim)`
+  - `out_gate.weight` shape `(hidden_dim, dim)`
+  - `to_out_norm.weight` shape `(hidden_dim,)`, `to_out_norm.bias` shape `(hidden_dim,)`
+  - `to_out.weight` shape `(dim, hidden_dim)`
+- `config` — dict with keys `"dim"` (int) and `"hidden_dim"` (int)
+
+The kernel must return a float32 tensor of shape `(bs, seqlen, seqlen, dim)`.
 
 **Reference algorithm (outgoing TriMul):**
 ```
@@ -26,27 +41,16 @@ return to_out(out)                                    # [B, N, N, dim]
 **Output:** float32 tensor of shape `[B, N, N, dim]`.
 **Correctness tolerance:** `rtol=2e-2, atol=2e-2`. TF32 disabled in reference.
 
-**Benchmark shapes and approximate compute profile:**
-| seqlen | bs | dim | hiddendim | Dominant op        | Approx SOL (μs) |
-|--------|-----|-----|-----------|-------------------|-----------------|
-| 256    | 2   | 128 | 128       | einsum (N³)       | ~9              |
-| 768    | 1   | 128 | 128       | einsum (N³)       | ~120            |
-| 256    | 2   | 384 | 128       | linears (dim×N²)  | ~25             |
-| 512    | 1   | 128 | 128       | einsum (N³)       | ~35             |
-| 1024   | 1   | 128 | 128       | einsum (N³)       | ~280            |
-| 768    | 1   | 384 | 128       | linears (dim×N²)  | ~150            |
-| 1024   | 1   | 384 | 128       | linears + einsum  | ~380            |
-
-SOL estimates assume H100 peak tensor core throughput (~989 TFlops FP32). The einsum `b i k d, b j k d -> b i j d` is equivalent to a batched GEMM over the N dimension: FLOPs = 2·B·H·N³. Linear projections cost 2·B·N²·dim·H each; with dim=384 they rival or exceed the einsum.
-
-**Key technical notes:**
-- The einsum contracts over the middle `k` axis of `left[B, N, k, H]` and `right[B, j, k, H]`, equivalent to `(B·H)` independent N×N matrix multiplications.
-- Optimal layout for cuBLAS/Triton: permute left/right to `[B·H, N, N]`, use batched GEMM, then permute back.
-- `torch.compile` or `torch.matmul` with appropriate reshapes can reach near-cuBLAS speeds for the einsum.
-- The 5 linear projections share the same input `x` — fusing them into a single GEMM reduces kernel launch overhead and can improve cache reuse.
-- For large seqlens (≥768), the einsum dominates; for large dims (384), linear projections contribute significantly.
-- Mask is float32 (0.0/1.0); when `nomask=True` the mask is all-ones and masking can be skipped.
-- Correctness: the reference disables TF32, so FP32 accumulation is required; BF16 accumulation for the einsum is acceptable given the 2% tolerance.
+**Benchmark shapes:**
+| seqlen | bs | dim | hiddendim | Approx SOL (μs) |
+|--------|-----|-----|-----------|-----------------|
+| 256    | 2   | 128 | 128       | ~9              |
+| 768    | 1   | 128 | 128       | ~120            |
+| 256    | 2   | 384 | 128       | ~25             |
+| 512    | 1   | 128 | 128       | ~35             |
+| 1024   | 1   | 128 | 128       | ~280            |
+| 768    | 1   | 384 | 128       | ~150            |
+| 1024   | 1   | 384 | 128       | ~380            |
 
 **Metric:** Geometric mean latency across all 7 benchmark cases (lower is better).
 **Score:** 3000 / geomean_us (higher is better).

@@ -1,5 +1,5 @@
 """
-TriMul submission — fused gate+mask + fused transpose+LN+gate Triton kernels + cuBLAS GEMMs.
+TriMul submission — fused LN+GEMM, fused gate+mask, fused LN+gate Triton kernels.
 """
 
 import torch
@@ -9,6 +9,128 @@ import triton.language as tl
 
 # Module-level weight cache
 _weight_cache = {}
+# Pre-allocated intermediate buffer cache keyed on (weight_key, B, N, H, D)
+_buf_cache = {}
+
+
+@triton.jit
+def _fused_ln_linear_kernel(
+    # Input: (M, D)
+    x_ptr,
+    # LN params
+    norm_w_ptr, norm_b_ptr,
+    # Weight: (K, D)  where K = 5*H
+    w_ptr,
+    # Output: (M, K)
+    out_ptr,
+    M, D, K,
+    stride_xm,   # = D (row stride of x)
+    stride_wk,   # = D (row stride of w)
+    stride_om,   # = K (row stride of out)
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    eps: tl.constexpr,
+):
+    """
+    Fused LayerNorm + Linear: out[m, k] = dot(LN(x[m,:]), w[k,:])
+    Grid: (cdiv(M, BLOCK_M), cdiv(K, BLOCK_K))
+    Each program: load BLOCK_M rows of x, compute LN, then dot vs BLOCK_K weight rows.
+    """
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    k_offs = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    m_mask = m_offs < M
+    k_mask = k_offs < K
+
+    # --- Load input x[m, :] and compute LN stats ---
+    # Load full D-width rows for LN: (BLOCK_M, BLOCK_D) tiles over D
+    # Accumulate mean and variance first
+    mean = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for d_start in range(0, D, BLOCK_D):
+        d_offs = d_start + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
+        x_tile = tl.load(
+            x_ptr + m_offs[:, None] * stride_xm + d_offs[None, :],
+            mask=m_mask[:, None] & d_mask[None, :], other=0.0
+        )  # (BLOCK_M, BLOCK_D)
+        mean += tl.sum(x_tile, axis=1)
+    mean = mean / D  # (BLOCK_M,)
+
+    var = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for d_start in range(0, D, BLOCK_D):
+        d_offs = d_start + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
+        x_tile = tl.load(
+            x_ptr + m_offs[:, None] * stride_xm + d_offs[None, :],
+            mask=m_mask[:, None] & d_mask[None, :], other=0.0
+        )
+        diff = x_tile - mean[:, None]
+        var += tl.sum(diff * diff, axis=1)
+    var = var / D
+    inv_std = tl.rsqrt(var + eps)  # (BLOCK_M,)
+
+    # --- Compute GEMM: acc[m, k] = sum_d LN(x[m,d]) * w[k,d] ---
+    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    for d_start in range(0, D, BLOCK_D):
+        d_offs = d_start + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
+
+        # Load x tile and normalize on-the-fly
+        x_tile = tl.load(
+            x_ptr + m_offs[:, None] * stride_xm + d_offs[None, :],
+            mask=m_mask[:, None] & d_mask[None, :], other=0.0
+        )  # (BLOCK_M, BLOCK_D)
+        x_norm = (x_tile - mean[:, None]) * inv_std[:, None]  # (BLOCK_M, BLOCK_D)
+
+        # Apply LN affine: norm_w[d], norm_b[d]
+        nw = tl.load(norm_w_ptr + d_offs, mask=d_mask, other=0.0)  # (BLOCK_D,)
+        nb = tl.load(norm_b_ptr + d_offs, mask=d_mask, other=0.0)
+        x_norm = x_norm * nw[None, :] + nb[None, :]  # (BLOCK_M, BLOCK_D)
+
+        # Load weight tile w[k, d]: (BLOCK_K, BLOCK_D)
+        w_tile = tl.load(
+            w_ptr + k_offs[:, None] * stride_wk + d_offs[None, :],
+            mask=k_mask[:, None] & d_mask[None, :], other=0.0
+        )
+
+        # Accumulate: (BLOCK_M, BLOCK_D) @ (BLOCK_D, BLOCK_K) -> (BLOCK_M, BLOCK_K)
+        acc += tl.dot(x_norm, tl.trans(w_tile))
+
+    # Store output
+    tl.store(
+        out_ptr + m_offs[:, None] * stride_om + k_offs[None, :],
+        acc, mask=m_mask[:, None] & k_mask[None, :]
+    )
+
+
+def fused_ln_linear(x, norm_w, norm_b, weight, M, D, K):
+    """
+    x: (M, D) — raw input (not yet LN'd)
+    norm_w, norm_b: (D,) LN params
+    weight: (K, D) — fused projection weight
+    Returns: (M, K) = LN(x) @ weight.T
+    """
+    out = torch.empty(M, K, device=x.device, dtype=x.dtype)
+
+    BLOCK_M = 16
+    BLOCK_K = 64
+    BLOCK_D = triton.next_power_of_2(min(D, 128))  # tile D; D=128 or 384
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_K))
+
+    _fused_ln_linear_kernel[grid](
+        x, norm_w, norm_b, weight, out,
+        M, D, K,
+        D, D, K,   # strides
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
+        BLOCK_D=BLOCK_D,
+        eps=1e-5,
+    )
+    return out
 
 
 @triton.jit
