@@ -20,8 +20,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import anthropic
 from dotenv import load_dotenv
@@ -44,6 +46,50 @@ RESULTS_FILE   = os.path.join(PROJECT_DIR, "results.json")
 def load_prompt(filename: str) -> str:
     with open(os.path.join(PROJECT_DIR, filename)) as f:
         return f.read()
+
+
+# ---------------------------------------------------------------------------
+# Token usage tracking (consistent with SOL-1-BES)
+# ---------------------------------------------------------------------------
+
+_token_lock = threading.Lock()
+_token_totals: dict = {"input_tokens": 0, "output_tokens": 0, "api_calls": 0}
+_token_file: Path | None = None
+
+
+def _flush_tokens() -> None:
+    if _token_file is not None:
+        _token_file.write_text(json.dumps(_token_totals, indent=2))
+
+
+def _record(usage) -> None:
+    with _token_lock:
+        _token_totals["input_tokens"] += getattr(usage, "input_tokens", 0)
+        _token_totals["output_tokens"] += getattr(usage, "output_tokens", 0)
+        _token_totals["api_calls"] += 1
+        _flush_tokens()
+
+
+def _patch_anthropic() -> None:
+    _orig_sync = anthropic.resources.messages.Messages.create
+
+    def _sync_create(self, *args, **kwargs):
+        response = _orig_sync(self, *args, **kwargs)
+        if getattr(response, "usage", None):
+            _record(response.usage)
+        return response
+
+    anthropic.resources.messages.Messages.create = _sync_create
+
+    _orig_async = anthropic.resources.messages.AsyncMessages.create
+
+    async def _async_create(self, *args, **kwargs):
+        response = await _orig_async(self, *args, **kwargs)
+        if getattr(response, "usage", None):
+            _record(response.usage)
+        return response
+
+    anthropic.resources.messages.AsyncMessages.create = _async_create
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +472,10 @@ def main() -> None:
                            f"{timestamp}_attn_bwd_{baseline_name}")
     os.makedirs(run_dir, exist_ok=True)
     set_run_directory(run_dir)
+
+    global _token_file
+    _token_file = Path(run_dir) / "token_usage.json"
+    _patch_anthropic()
 
     if baseline_path:
         shutil.copy2(baseline_path, SUBMISSION_FILE)

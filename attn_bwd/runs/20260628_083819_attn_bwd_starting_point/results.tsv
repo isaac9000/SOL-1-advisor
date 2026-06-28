@@ -1,0 +1,27 @@
+experiment	agent_iteration	commit	time_us	status	description
+1	0	HEAD	3428.25	keep	Baseline 'starting_point' — initial benchmark
+2	1	HEAD	0.00	crash	Two Triton kernels replacing the pure-PyTorch baseline:
+3	2	HEAD	0.00	crash	1. `inv_keep` is now a regular Python float passed as a runtime kernel argument (not `tl.constexpr`)
+4	3	HEAD	2194.37	keep	1. `_attn_bwd_impl` — a clean pure-PyTorch function that uses the GQA group structure directly: resh
+5	4	HEAD	1175.61	keep	1. **Removed the pre-compiled `.contiguous().to(torch.float32)` step** — `grad_attn_output` is now p
+6	5	HEAD	689.58	keep	1. **Fully bf16 softmax backward**: Removed all `.to(torch.float32)` casts from `P_g`, `dP_g_f`. The
+7	6	HEAD	0.00	crash	1. **Split into two compiled functions** `_attn_bwd_ds` and `_attn_bwd_dv` — each takes only the ten
+8	7	HEAD	594.31	keep	1. **dP as flat batched GEMM**: Reshaped `dO` to `[bs*8, 10*sq, 128]` and `V` to `[bs*8, skv, 128]`,
+9	8	HEAD	0.00	crash	1. **Split into two compiled functions** `_attn_bwd_ds` and `_attn_bwd_dv`, both with `mode="max-aut
+10	9	HEAD	655.98	discard	1. **Compact dV GEMM**: `attn_weights_dropped` (shape [bs,80,sq,skv]) is reshaped via `.reshape()` t
+11	10	HEAD	463.73	keep	1. **`softmax_bwd_kernel`** — a Triton kernel with grid=(n_rows,) where n_rows=bs*80*seq_q. Each pro
+12	11	HEAD	427.14	keep	1. **Compact dV GEMM with .contiguous() fix**: `attn_weights_dropped.contiguous().view(bs*8, 10*sq, 
+13	12	HEAD	410.51	keep	1. **Single-pass Triton kernel**: Added `SINGLE_PASS: tl.constexpr` parameter. When `seq_kv <= BLOCK
+14	13	HEAD	0.00	crash	1. **New `dv_kernel` Triton kernel**: Grid=(bs*n_kv_heads, cdiv(seq_kv, BLOCK_SKV)). Each program ac
+15	14	HEAD	0.00	crash	1. **All stride parameters changed to regular runtime ints**: `dO_s_bs`, `dO_s_sq`, `dO_s_h`, `Pd_s_
+16	15	HEAD	505.83	discard	1. **`_gemm_impl` compiled function**: Wraps both the dP GEMM and the dV GEMM under `torch.compile(m
+17	16	HEAD	757.25	discard	1. **`_gemm_impl` with `reduce-overhead`**: Changed from `max-autotune-no-cudagraphs` (which explici
+18	17	HEAD	0.00	crash	1. **Row-major Pd load**: Changed from the previous `Pd_ptrs[skv_idx, sq_idx]` (column-major/transpo
+19	18	HEAD	408.12	keep	1. **Restored exact experiment 13 structure**: All three operations (dP BMM, Triton softmax-bwd, dV 
+20	19	HEAD	408.64	discard	1. **`@triton.autotune` decorator** with 9 configs covering `num_warps ∈ {1,2,4,8,16,32}` and `num_s
+21	20	HEAD	1003.11	discard	1. **`flash_attn_bwd_ds_kernel`**: Grid=(bs*n_heads, cdiv(seq_q, BLOCK_SQ)). Each program handles on
+22	21	HEAD	797.74	discard	1. **Pre-transposed V**: `value_states.reshape(bs*8, skv, 128).transpose(-2,-1).contiguous()` → `[bs
+23	22	HEAD	409.42	discard	Restored the exact experiment 19 structure (best at 408 μs) with the proven @triton.autotune softmax
+24	23	HEAD	5691.07	discard	1. **5D broadcast dP matmul**: `dO_5d = grad_attn_output.view(bs, seq_q, n_kv_heads, n_groups, HEAD_
+25	24	HEAD	409.36	discard	Restored the exact experiment 19 structure (best at 408.12 μs):
+26	25	HEAD	409.80	discard	Exact experiment 19 structure confirmed and written. No changes made to the algorithm.

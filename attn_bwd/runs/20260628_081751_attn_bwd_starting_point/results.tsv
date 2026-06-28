@@ -1,0 +1,6 @@
+experiment	agent_iteration	commit	time_us	status	description
+1	0	HEAD	3427.91	keep	Baseline 'starting_point' — initial benchmark
+2	1	HEAD	2208.86	keep	**
+3	2	HEAD	628.38	keep	**
+4	3	HEAD	518.44	keep	**
+5	4	HEAD	551.64	discard	**

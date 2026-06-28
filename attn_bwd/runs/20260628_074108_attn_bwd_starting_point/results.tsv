@@ -1,0 +1,27 @@
+experiment	agent_iteration	commit	time_us	status	description
+1	0	HEAD	3437.26	keep	Baseline 'starting_point' — initial benchmark
+2	1	HEAD	0.00	crash	** Two Triton kernels (`attn_bwd_ds_kernel_v2` and `attn_bwd_dv_kernel`) replacing the pure-PyTorch 
+3	2	HEAD	0.00	crash	** Rewrote both Triton kernels with the architecture constants properly passed as `tl.constexpr` arg
+4	3	HEAD	1954.76	keep	**
+5	4	HEAD	0.00	crash	** Two clean Triton kernels written from scratch:
+6	5	HEAD	867.00	keep	**
+7	6	HEAD	0.00	crash	**
+8	7	HEAD	0.00	crash	**
+9	8	HEAD	616.85	keep	**
+10	9	HEAD	652.25	discard	**
+11	10	HEAD	560.81	keep	** Single targeted change — added `dynamic=True` to the `torch.compile` call:
+12	11	HEAD	769.76	discard	**
+13	12	HEAD	717.34	discard	**
+14	13	HEAD	0.00	crash	** Single targeted change to the `torch.compile` call — added `options` dict:
+15	14	HEAD	533.42	keep	** Three inductor config flags set at module import time, before `torch.compile` is called:
+16	15	HEAD	598.55	discard	** Added 5 new inductor config flags inside the existing try-except block, after the 3 proven flags 
+17	16	HEAD	637.91	discard	**
+18	17	HEAD	0.00	crash	**
+19	18	HEAD	595.46	discard	**
+20	19	HEAD	714.51	discard	**
+21	20	HEAD	900.74	discard	** Single targeted change — switched `mode` from `"max-autotune-no-cudagraphs"` to `"max-autotune"`:
+22	21	HEAD	521.59	keep	** Two `.contiguous()` additions to the Exp 15 function body:
+23	22	HEAD	3429.67	discard	**
+24	23	HEAD	522.49	discard	** Full Exp 22 reconstruction from the reverted baseline, with the targeted change:
+25	24	HEAD	521.53	keep	** Exact reproduction of Experiment 22:
+26	25	HEAD	584.25	discard	** Exact reproduction of Experiment 22 (the best known result at 521.59 μs, confirmed at 521.53 μs i

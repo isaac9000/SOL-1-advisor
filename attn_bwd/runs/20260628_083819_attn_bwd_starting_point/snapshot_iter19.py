@@ -1,6 +1,6 @@
 """
 Hybrid attention-backward kernel: PyTorch BMMs + Triton elementwise softmax-bwd.
-Final: exact experiment 19 structure (best at 408 μs).
+v9: tune num_warps for softmax-bwd kernel (use num_warps=8 for large seqs).
 
 custom_kernel(data) receives:
     data = (grad_attn_output, attn_weights, attn_weights_dropped,
@@ -32,10 +32,6 @@ N_GROUPS = NUM_ATTENTION_HEADS // NUM_KEY_VALUE_HEADS  # 10
 # Triton kernel: fused softmax-backward + dropout-undo
 #   One program per row (length = seq_kv).
 #   Grid: (n_rows,)  where n_rows = bs * 80 * seq_q
-#
-#   SINGLE_PASS=True:  seq_kv <= BLOCK — load entire row into registers,
-#                      compute rowsum in-register, write once. 2× less HBM.
-#   SINGLE_PASS=False: seq_kv > BLOCK  — two-pass tiled version.
 # ─────────────────────────────────────────────────────────────────────────────
 @triton.jit
 def softmax_bwd_kernel(
@@ -56,6 +52,7 @@ def softmax_bwd_kernel(
     dS_row   = dS_ptr   + row * seq_kv
 
     if SINGLE_PASS:
+        # Load entire row into registers (seq_kv <= BLOCK): single pass
         off   = tl.arange(0, BLOCK)
         valid = off < seq_kv
 
@@ -106,11 +103,13 @@ def fused_softmax_bwd(dP_dropped, attn_weights, dropout_mask, inv_keep):
     BLOCK = min(triton.next_power_of_2(seq_kv), 8192)
     SINGLE_PASS = (seq_kv <= BLOCK)
 
-    # num_warps tuning: 8 warps for two-pass (large seq), adaptive for single-pass
+    # num_warps tuning:
+    #   - SINGLE_PASS (small seq): 4 warps is sufficient, avoids over-subscription
+    #   - two-pass (large seq): 8 warps for better memory bandwidth utilization
     if SINGLE_PASS:
         num_warps = min(max(BLOCK // 256, 1), 16)
     else:
-        num_warps = 8
+        num_warps = 8  # fixed 8 warps for two-pass path (large sequences)
 
     softmax_bwd_kernel[(n_rows,)](
         dP_flat, P_flat, mask_flat, dS_flat,
@@ -136,17 +135,17 @@ def custom_kernel(data):
 
     inv_keep = float(1.0 / (1.0 - attention_dropout)) if attention_dropout > 0.0 else 1.0
 
-    # Transpose dO: [bs, sq, 80, 128] → [bs, 80, sq, 128] → [bs*8, 10*sq, 128]
-    dO = grad_attn_output.permute(0, 2, 1, 3)
-    dO_flat_dp = dO.reshape(bs * n_kv_heads, n_groups * seq_q, HEAD_DIM)  # [bs*8, 10*sq, 128]
+    # Transpose dO (reshape handles contiguous copy)
+    dO = grad_attn_output.permute(0, 2, 1, 3)  # [bs, 80, sq, 128]  bf16
 
     # ── dP GEMM: [bs*8, 10*sq, 128] @ [bs*8, 128, skv] → [bs*8, 10*sq, skv] ─
-    V_flat    = value_states.reshape(bs * n_kv_heads, seq_kv, HEAD_DIM)   # [bs*8, skv, 128]
-    dP_flat   = torch.bmm(dO_flat_dp, V_flat.transpose(-2, -1))           # [bs*8, 10*sq, skv]
-    dP_drop_t = dP_flat.view(bs, n_heads, seq_q, seq_kv)
+    dO_flat_dp = dO.reshape(bs * n_kv_heads, n_groups * seq_q, HEAD_DIM)   # [bs*8, 10*sq, 128]
+    V_flat     = value_states.reshape(bs * n_kv_heads, seq_kv, HEAD_DIM)   # [bs*8, skv, 128]
+    dP_flat    = torch.bmm(dO_flat_dp, V_flat.transpose(-2, -1))           # [bs*8, 10*sq, skv]
+    dP_dropped_t = dP_flat.view(bs, n_heads, seq_q, seq_kv)
 
     # ── Fused softmax-backward + dropout undo (Triton) ───────────────────────
-    dS = fused_softmax_bwd(dP_drop_t, attn_weights, dropout_mask, inv_keep)
+    dS = fused_softmax_bwd(dP_dropped_t, attn_weights, dropout_mask, inv_keep)
 
     # ── dV GEMM: compact form, K=10*sq folds group accumulation ──────────────
     Pd_flat = attn_weights_dropped.view(bs * n_kv_heads, n_groups * seq_q, seq_kv)

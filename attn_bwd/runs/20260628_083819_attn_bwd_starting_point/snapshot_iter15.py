@@ -1,6 +1,6 @@
 """
 Hybrid attention-backward kernel: PyTorch BMMs + Triton elementwise softmax-bwd.
-Final: exact experiment 19 structure (best at 408 μs).
+v3: single-pass Triton kernel for small seq_kv, remove .contiguous() on Pd.
 
 custom_kernel(data) receives:
     data = (grad_attn_output, attn_weights, attn_weights_dropped,
@@ -39,12 +39,12 @@ N_GROUPS = NUM_ATTENTION_HEADS // NUM_KEY_VALUE_HEADS  # 10
 # ─────────────────────────────────────────────────────────────────────────────
 @triton.jit
 def softmax_bwd_kernel(
-    dP_ptr,
-    P_ptr,
-    mask_ptr,
-    dS_ptr,
-    inv_keep,
-    seq_kv,
+    dP_ptr,    # [n_rows, seq_kv]  bfloat16
+    P_ptr,     # [n_rows, seq_kv]  bfloat16
+    mask_ptr,  # [n_rows, seq_kv]  bool
+    dS_ptr,    # [n_rows, seq_kv]  bfloat16  (output)
+    inv_keep,  # float
+    seq_kv,    # int
     BLOCK: tl.constexpr,
     SINGLE_PASS: tl.constexpr,
 ):
@@ -56,16 +56,20 @@ def softmax_bwd_kernel(
     dS_row   = dS_ptr   + row * seq_kv
 
     if SINGLE_PASS:
+        # Load entire row into registers (seq_kv <= BLOCK)
         off   = tl.arange(0, BLOCK)
         valid = off < seq_kv
 
         dp_val = tl.load(dP_row + off, mask=valid, other=0.0).to(tl.float32)
         m_val  = tl.load(mask_row + off, mask=valid, other=0).to(tl.int1)
         dp_val = tl.where(m_val, dp_val * inv_keep, 0.0)
+
         p_val  = tl.load(P_row + off, mask=valid, other=0.0).to(tl.float32)
 
+        # Rowsum and output in one shot
         rowsum = tl.sum(dp_val * p_val, axis=0)
-        tl.store(dS_row + off, (p_val * (dp_val - rowsum)).to(tl.bfloat16), mask=valid)
+        ds_val = p_val * (dp_val - rowsum)
+        tl.store(dS_row + off, ds_val.to(tl.bfloat16), mask=valid)
 
     else:
         n_blocks = tl.cdiv(seq_kv, BLOCK)
@@ -79,6 +83,7 @@ def softmax_bwd_kernel(
             dp_val = tl.load(dP_row + off, mask=valid, other=0.0).to(tl.float32)
             m_val  = tl.load(mask_row + off, mask=valid, other=0).to(tl.int1)
             dp_val = tl.where(m_val, dp_val * inv_keep, 0.0)
+
             p_val  = tl.load(P_row + off, mask=valid, other=0.0).to(tl.float32)
             rowsum += tl.sum(dp_val * p_val, axis=0)
 
@@ -90,6 +95,7 @@ def softmax_bwd_kernel(
             dp_val = tl.load(dP_row + off, mask=valid, other=0.0).to(tl.float32)
             m_val  = tl.load(mask_row + off, mask=valid, other=0).to(tl.int1)
             dp_val = tl.where(m_val, dp_val * inv_keep, 0.0)
+
             p_val  = tl.load(P_row + off, mask=valid, other=0.0).to(tl.float32)
             tl.store(dS_row + off, (p_val * (dp_val - rowsum)).to(tl.bfloat16), mask=valid)
 
@@ -104,20 +110,14 @@ def fused_softmax_bwd(dP_dropped, attn_weights, dropout_mask, inv_keep):
     dS_flat   = torch.empty_like(dP_flat)
 
     BLOCK = min(triton.next_power_of_2(seq_kv), 8192)
-    SINGLE_PASS = (seq_kv <= BLOCK)
-
-    # num_warps tuning: 8 warps for two-pass (large seq), adaptive for single-pass
-    if SINGLE_PASS:
-        num_warps = min(max(BLOCK // 256, 1), 16)
-    else:
-        num_warps = 8
+    SINGLE_PASS = (seq_kv <= BLOCK)  # True when seq_kv fits in one tile
 
     softmax_bwd_kernel[(n_rows,)](
         dP_flat, P_flat, mask_flat, dS_flat,
         inv_keep, seq_kv,
         BLOCK=BLOCK,
         SINGLE_PASS=SINGLE_PASS,
-        num_warps=num_warps,
+        num_warps=min(max(BLOCK // 256, 1), 32),
         num_stages=1,
     )
     return dS_flat.view(bs, n_heads, seq_q, seq_kv)
@@ -136,21 +136,26 @@ def custom_kernel(data):
 
     inv_keep = float(1.0 / (1.0 - attention_dropout)) if attention_dropout > 0.0 else 1.0
 
-    # Transpose dO: [bs, sq, 80, 128] → [bs, 80, sq, 128] → [bs*8, 10*sq, 128]
-    dO = grad_attn_output.permute(0, 2, 1, 3)
-    dO_flat_dp = dO.reshape(bs * n_kv_heads, n_groups * seq_q, HEAD_DIM)  # [bs*8, 10*sq, 128]
+    # Transpose dO (no .contiguous() — reshape handles it)
+    dO = grad_attn_output.permute(0, 2, 1, 3)  # [bs, 80, sq, 128]  bf16
 
     # ── dP GEMM: [bs*8, 10*sq, 128] @ [bs*8, 128, skv] → [bs*8, 10*sq, skv] ─
-    V_flat    = value_states.reshape(bs * n_kv_heads, seq_kv, HEAD_DIM)   # [bs*8, skv, 128]
-    dP_flat   = torch.bmm(dO_flat_dp, V_flat.transpose(-2, -1))           # [bs*8, 10*sq, skv]
-    dP_drop_t = dP_flat.view(bs, n_heads, seq_q, seq_kv)
+    dO_flat_dp = dO.reshape(bs * n_kv_heads, n_groups * seq_q, HEAD_DIM)   # [bs*8, 10*sq, 128]
+    V_flat     = value_states.reshape(bs * n_kv_heads, seq_kv, HEAD_DIM)   # [bs*8, skv, 128]
+    dP_flat    = torch.bmm(dO_flat_dp, V_flat.transpose(-2, -1))           # [bs*8, 10*sq, skv]
+    dP_dropped_t = dP_flat.view(bs, n_heads, seq_q, seq_kv)               # contiguous
 
     # ── Fused softmax-backward + dropout undo (Triton) ───────────────────────
-    dS = fused_softmax_bwd(dP_drop_t, attn_weights, dropout_mask, inv_keep)
+    dS = fused_softmax_bwd(dP_dropped_t, attn_weights, dropout_mask, inv_keep)
 
     # ── dV GEMM: compact form, K=10*sq folds group accumulation ──────────────
+    # attn_weights_dropped is [bs, 80, sq, skv] — contiguous as an input tensor.
+    # [bs, 80, sq, skv] → [bs*8, 10*sq, skv]: merge dims 0&1 (bs*80=bs*8*10),
+    # and dims 2 (10, sq→10*sq already merged as 80=8*10). .view() works on contiguous.
     Pd_flat = attn_weights_dropped.view(bs * n_kv_heads, n_groups * seq_q, seq_kv)
-    dV_flat = torch.bmm(Pd_flat.transpose(-2, -1), dO_flat_dp)            # [bs*8, skv, 128]
+    # [bs*8, skv, 10*sq] @ [bs*8, 10*sq, 128] → [bs*8, skv, 128]
+    dV_flat = torch.bmm(Pd_flat.transpose(-2, -1), dO_flat_dp)
+    # Direct reshape — K=10*sq accumulated all groups
     dV = dV_flat.view(bs, n_kv_heads, seq_kv, HEAD_DIM).to(torch.bfloat16)
 
     return dS, dV
